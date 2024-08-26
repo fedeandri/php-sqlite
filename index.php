@@ -357,8 +357,7 @@ function runTest($db) {
 			Built by <a href="https://x.com/fedeandri">@fedeandri</a> starting from
 			<a href="https://x.com/ashleyrudland/status/1826991719646179583"
 			  target="_blank"
-			  rel="noopener noreferrer">@ashleyrudland</a>
-			code. See the source of this
+			  rel="noopener noreferrer">@ashleyrudland</a>'s PHP code. See the source of this
 			<a href="https://github.com/fedeandri/php-sqlite"
 			  target="_blank"
 			  rel="noopener noreferrer">PHP / SQLite Test on Github</a>.
