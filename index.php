@@ -2,43 +2,57 @@
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
 
-$db_path = 'database.sqlite';
+$databaseFile = 'database.sqlite';
+$maxCacheSeconds = 300;
+$maxSecondsPerTest = 3;
 
 // Initialize database connection
 try {
-    $db = new SQLite3($db_path);
+    $db = new SQLite3($databaseFile);
     $db->enableExceptions(true);
     
     // Enable Write-Ahead Logging for better concurrency and performance
     $db->exec('PRAGMA journal_mode = WAL;');
-    // Set cache size to approximately 10MB (-10000 pages, where each page is 1KB)
-    $db->exec('PRAGMA cache_size = -10000;');
+    // Increase cache size to approximately 100MB (-25000 pages, where each page is 4KB)
+    $db->exec('PRAGMA cache_size = -25000;');
     // Set synchronous mode to NORMAL for a balance between safety and performance
+    // Set synchronous mode to FULL for maximum durability at the cost of performance
     $db->exec('PRAGMA synchronous = NORMAL;');
     // Store temporary tables and indices in memory instead of on disk
     $db->exec('PRAGMA temp_store = MEMORY;');
     // Set the maximum size of the memory-mapped I/O to approximately 1GB
     $db->exec('PRAGMA mmap_size = 1000000000;');
+    // Enable foreign key constraints for data integrity
+    $db->exec('PRAGMA foreign_keys = true;');
+    // Set a busy timeout of 5 seconds to wait if the database is locked
+    $db->exec('PRAGMA busy_timeout = 5000;');
+    // Enable incremental vacuuming to reclaim unused space and keep the database file size optimized
+    $db->exec('PRAGMA auto_vacuum = INCREMENTAL;');
+    // Use STRICT on table creation for better data integrity
+    $db->exec("
+        CREATE TABLE IF NOT EXISTS test_results_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            result TEXT NOT NULL,
+            timestamp INTEGER NOT NULL
+        ) STRICT
+    ");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_test_results_cache_timestamp ON test_results_cache (timestamp)");
 
-    // Create test_results_cache table if it doesn't exist
-    $db->exec('CREATE TABLE IF NOT EXISTS test_results_cache (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        result TEXT NOT NULL,
-        timestamp INTEGER NOT NULL
-    )');
+    $db->exec("
+        CREATE TABLE IF NOT EXISTS comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            author TEXT NOT NULL,
+            content TEXT NOT NULL,
+            test_session TEXT NOT NULL,
+            timestamp INTEGER NOT NULL
+        ) STRICT
+    ");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_comments_timestamp ON comments (timestamp)");
     
-    // Create comments table if it doesn't exist, adding the timestamp column
-    $db->exec('CREATE TABLE IF NOT EXISTS comments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        author TEXT NOT NULL,
-        content TEXT NOT NULL,
-        test_session TEXT NOT NULL,
-        timestamp INTEGER NOT NULL
-    )');
 } catch (Exception $e) {
     die('Database connection failed: ' . $e->getMessage() . 
-        ' (DB Path: ' . $db_path . 
-        ', Directory Writable: ' . (is_writable(dirname($db_path)) ? 'Yes' : 'No') . 
+        ' (DB Path: ' . $databaseFile . 
+        ', Directory Writable: ' . (is_writable(dirname($databaseFile)) ? 'Yes' : 'No') . 
         ', PHP User: ' . get_current_user() . 
         ')');
 }
@@ -121,12 +135,15 @@ function getServerSpecs() {
  */
 function getCachedTest($db) {
 
+    global $maxCacheSeconds;
+
     // Use a prepared statement for better caching of query plans
     $stmt = $db->prepare('SELECT * FROM test_results_cache ORDER BY timestamp DESC LIMIT 1');
     $result = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
 
-    if ($result && (time() - $result['timestamp'] < 300)) { // Cache for 5 minutes
-        return json_decode($result['result'], true);
+    if ($result && (time() - $result['timestamp'] < $maxCacheSeconds)) {
+        $decodedResult = json_decode($result['result'], true);
+        return $decodedResult;
     }
 
     $testResult = runTest($db);
@@ -149,88 +166,108 @@ function getCachedTest($db) {
  * @return array Test results
  */
 function runTest($db) {
-    $startTime = microtime(true);
-    $maxDuration = 5; // Maximum test duration in seconds
-    $chunkSize = 10;
-    $writes = 0;
-    $failures = 0;
-    $newRecords = [];
+    global $databaseFile, $maxSecondsPerTest;
 
-    // Generate a unique test session ID
+    $maxDuration = $maxSecondsPerTest; // Maximum test duration in seconds
+    $chunkSize = 100;
     $testSessionId = uniqid('test_', true);
-
-    // Set the current timestamp for all inserts in this test
     $currentTimestamp = time();
 
-    $stmt = $db->prepare('INSERT INTO comments (author, content, test_session, timestamp) VALUES (:author, :content, :test_session, :timestamp)');
+    // Prepare statements
+    $insertStmt = $db->prepare('INSERT INTO comments (author, content, test_session, timestamp) VALUES (:author, :content, :test_session, :timestamp)');
+    $selectStmt = $db->prepare('SELECT * FROM comments WHERE id = :id');
+    $updateStmt = $db->prepare('UPDATE comments SET content = :content WHERE id = :id');
+    $deleteStmt = $db->prepare('DELETE FROM comments WHERE id = :id');
 
-    while (microtime(true) - $startTime < $maxDuration) {
-        $values = [];
-        for ($j = 0; $j < $chunkSize; $j++) {
-            $values[] = [
-                'author' => substr(str_shuffle('abcdefghijklmnopqrstuvwxyz'), 0, 7),
-                'content' => substr(str_shuffle('abcdefghijklmnopqrstuvwxyz'), 0, 7),
-            ];
-        }
-
+    // Write test
+    $writeStart = microtime(true);
+    $writes = 0;
+    $newRecords = [];
+    while (microtime(true) - $writeStart < $maxDuration) {
         $db->exec('BEGIN TRANSACTION');
-        foreach ($values as $value) {
-            $stmt->bindValue(':author', $value['author'], SQLITE3_TEXT);
-            $stmt->bindValue(':content', $value['content'], SQLITE3_TEXT);
-            $stmt->bindValue(':test_session', $testSessionId, SQLITE3_TEXT);
-            $stmt->bindValue(':timestamp', $currentTimestamp, SQLITE3_INTEGER);
-            if ($stmt->execute()) {
+        for ($j = 0; $j < $chunkSize; $j++) {
+            $author = substr(str_shuffle('abcdefghijklmnopqrstuvwxyz'), 0, rand(5, 20));
+            $content = substr(str_shuffle('abcdefghijklmnopqrstuvwxyz'), 0, rand(10, 100));
+            $insertStmt->bindValue(':author', $author, SQLITE3_TEXT);
+            $insertStmt->bindValue(':content', $content, SQLITE3_TEXT);
+            $insertStmt->bindValue(':test_session', $testSessionId, SQLITE3_TEXT);
+            $insertStmt->bindValue(':timestamp', $currentTimestamp, SQLITE3_INTEGER);
+            if ($insertStmt->execute()) {
                 $newRecords[] = $db->lastInsertRowID();
                 $writes++;
-            } else {
-                $failures++;
             }
         }
         $db->exec('COMMIT');
-
-        // Check if we've exceeded the time limit after each chunk
-        if (microtime(true) - $startTime >= $maxDuration) {
-            break;
-        }
     }
-
-    $writeTime = microtime(true) - $startTime;
+    $writeTime = microtime(true) - $writeStart;
     $writesPerSecond = round($writes / $writeTime);
 
-    // Measure reads (sample a subset of new records to avoid memory issues)
+    // Read test
     $readStart = microtime(true);
-    $readSampleSize = min(10000, count($newRecords));
-    $readSample = array_rand(array_flip($newRecords), $readSampleSize);
-    $stmt = $db->prepare('SELECT * FROM comments WHERE id = :id');
-    foreach ($readSample as $id) {
-        $stmt->bindValue(':id', $id, SQLITE3_INTEGER);
-        $stmt->execute();
+    $reads = 0;
+    $readDuration = 0;
+    while ($readDuration < $maxDuration) {
+        $id = $newRecords[array_rand($newRecords)];
+        $selectStmt->bindValue(':id', $id, SQLITE3_INTEGER);
+        $selectStmt->execute();
+        $reads++;
+        $readDuration = microtime(true) - $readStart;
     }
-    $readTime = microtime(true) - $readStart;
-    $readsPerSecond = round(($readSampleSize / $readTime) * (count($newRecords) / $readSampleSize));
+    $readsPerSecond = round($reads / $readDuration);
 
-    // Get total count and DB size
-    $total = $db->querySingle('SELECT COUNT(*) FROM comments');
-    $dbSizeInMb = round(filesize($GLOBALS['db_path']) / 1024 / 1024, 2);
+    // Update test
+    $updateStart = microtime(true);
+    $updates = 0;
+    $updateDuration = 0;
+    while ($updateDuration < $maxDuration) {
+        $id = $newRecords[array_rand($newRecords)];
+        $newContent = substr(str_shuffle('abcdefghijklmnopqrstuvwxyz'), 0, rand(10, 100));
+        $updateStmt->bindValue(':id', $id, SQLITE3_INTEGER);
+        $updateStmt->bindValue(':content', $newContent, SQLITE3_TEXT);
+        $updateStmt->execute();
+        $updates++;
+        $updateDuration = microtime(true) - $updateStart;
+    }
+    $updatesPerSecond = round($updates / $updateDuration);
 
-    // Delete the records inserted during this test and comments older than 10 minutes
-    $tenMinutesAgo = time() - 600;
-    $db->exec("DELETE FROM comments WHERE test_session = '$testSessionId' OR timestamp < $tenMinutesAgo");
+    // Delete test
+    $deleteStart = microtime(true);
+    $deletes = 0;
+    $deleteDuration = 0;
+    while ($deleteDuration < $maxDuration && !empty($newRecords)) {
+        $id = array_pop($newRecords);
+        $deleteStmt->bindValue(':id', $id, SQLITE3_INTEGER);
+        $deleteStmt->execute();
+        $deletes++;
+        $deleteDuration = microtime(true) - $deleteStart;
+    }
+    $deletesPerSecond = round($deletes / $deleteDuration);
 
-    $totalDuration = microtime(true) - $startTime;
+    // Clean up remaining test data
+    $db->exec("DELETE FROM comments WHERE test_session = '$testSessionId'");
 
+    $dbSizeInMb = round(filesize($databaseFile) / 1024 / 1024, 2);
+
+    $totalOperations = $writes + $reads + $updates + $deletes;
+    $operationsPerSecond = round($totalOperations / ($maxDuration * 4)); // Multiply by 4 because there are 4 test phases
+    
     return [
         'dbSizeInMb' => $dbSizeInMb,
-        'failureRate' => round(($failures / $writes) * 100, 2),
-        'reads' => $readSampleSize,
-        'readsPerSecond' => $readsPerSecond,
-        'total' => $total,
+        'totalOperations' => $totalOperations,
+        'operationsPerSecond' => $operationsPerSecond,
         'writes' => $writes,
         'writesPerSecond' => $writesPerSecond,
-        'writeTime' => round($writeTime, 2),
-        'duration' => round($totalDuration, 2),
+        'reads' => $reads,
+        'readsPerSecond' => $readsPerSecond,
+        'updates' => $updates,
+        'updatesPerSecond' => $updatesPerSecond,
+        'deletes' => $deletes,
+        'deletesPerSecond' => $deletesPerSecond,
+        'duration' => round(microtime(true) - $writeStart, 2),
     ];
 }
+
+$db->close();
 
 ?>
 <!DOCTYPE html>
@@ -357,12 +394,14 @@ function runTest($db) {
 			Built by <a href="https://x.com/fedeandri">@fedeandri</a> starting from
 			<a href="https://x.com/ashleyrudland/status/1826991719646179583"
 			  target="_blank"
-			  rel="noopener noreferrer">@ashleyrudland</a>'s PHP code. See the source of this
+			  rel="noopener noreferrer">@ashleyrudland</a>'s PHP code. See the <strong>source</strong> of this
 			<a href="https://github.com/fedeandri/php-sqlite"
 			  target="_blank"
 			  rel="noopener noreferrer">PHP / SQLite Test on Github</a>.
-			<br /> From my SQLite tests <strong>PHP+JS writes ~10x faster and reads ~40x faster</strong> than
-			Node based apps.
+              <br /> <s>From my SQLite tests <strong>PHP writes are ~10x faster and reads are ~40x faster</strong> than Node.</s>
+			<br />NEW RESULTS: <strong>Node writes are ~2x faster</strong> than PHP and <strong>PHP reads are ~1.15x faster</strong> than Node.
+			<br />--
+			<br />I wanted to run more comprehensive tests, so I added updates and deletes. Then, to test a scenario closer to real life usage, I added indexes, more data variation, and tweaked SQLite for better data durability other than pure performance (thanks to <a href="https://x.com/jasonleowsg" target="_blank" rel="noopener noreferrer">@jasonleowsg</a> for pointing me to <a href="https://x.com/meln1k/status/1813314113705062774" target="_blank" rel="noopener noreferrer">this post</a>). For Node-based apps, I switched from sqlite3 to <a href="https://www.npmjs.com/package/better-sqlite3" target="_blank" rel="noopener noreferrer">better-sqlite3</a> (thanks to <a href="https://x.com/theSlavenIvanov" target="_blank" rel="noopener noreferrer">@theSlavenIvanov</a> for the recommendation), and this really levels the playing field.
 		</p>
 		<div class="container">
 			<div class="card">
@@ -426,12 +465,16 @@ function runTest($db) {
 						let content = '<ul>';
 						content += `<li>Duration: ${result.duration ? result.duration.toLocaleString() : 'N/A'} seconds</li>`;
 						content += `<li>DB size: ${result.dbSizeInMb ? (result.dbSizeInMb >= 1024 ? (result.dbSizeInMb / 1024).toLocaleString(undefined, { maximumFractionDigits: 1 }) + 'GB' : result.dbSizeInMb.toLocaleString() + 'MB') : 'N/A'}</li>`;
-						content += `<li>Records processed: ${result.total ? result.total.toLocaleString() : 'N/A'}</li>`;
+						content += `<li>Total operations: ${result.totalOperations ? result.totalOperations.toLocaleString() : 'N/A'}</li>`;
+						content += `<li>Operations/sec: ${result.operationsPerSecond ? result.operationsPerSecond.toLocaleString() : 'N/A'}</li>`;
+						content += `<li>Writes: ${result.writes ? result.writes.toLocaleString() : 'N/A'}</li>`;
+						content += `<li>Writes/sec: ${result.writesPerSecond ? result.writesPerSecond.toLocaleString() : 'N/A'}</li>`;
+						content += `<li>Reads: ${result.reads ? result.reads.toLocaleString() : 'N/A'}</li>`;
 						content += `<li>Reads/sec: ${result.readsPerSecond ? result.readsPerSecond.toLocaleString() : 'N/A'}</li>`;
-						content += `<li class="font-medium">Writes/sec: ${result.writesPerSecond ? result.writesPerSecond.toLocaleString() : 'N/A'}</li>`;
-						if (result.failureRate && result.failureRate > 0) {
-							content += `<li>Failure rate: ${result.failureRate}%</li>`;
-						}
+						content += `<li>Updates: ${result.updates ? result.updates.toLocaleString() : 'N/A'}</li>`;
+						content += `<li>Updates/sec: ${result.updatesPerSecond ? result.updatesPerSecond.toLocaleString() : 'N/A'}</li>`;
+						content += `<li>Deletes: ${result.deletes ? result.deletes.toLocaleString() : 'N/A'}</li>`;
+						content += `<li>Deletes/sec: ${result.deletesPerSecond ? result.deletesPerSecond.toLocaleString() : 'N/A'}</li>`;
 						content += '</ul>';
 						document.getElementById('results-box').innerHTML = content;
 					})
