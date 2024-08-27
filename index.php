@@ -399,7 +399,7 @@ $db->close();
 			  target="_blank"
 			  rel="noopener noreferrer">PHP / SQLite Test on Github</a>.
               <br /> <s>From my SQLite tests <strong>PHP writes are ~10x faster and reads are ~40x faster</strong> than Node.</s>
-			<br />NEW RESULTS: <strong>Node writes are ~2x faster</strong> than PHP and <strong>PHP reads are ~1.15x faster</strong> than Node.
+			<br />NEW RESULTS: <strong>Node writes are ~2x faster</strong> than PHP and <strong>PHP reads are ~1.2x faster</strong> than Node.
 			<br />--
 			<br />I wanted to run more comprehensive tests, so I added updates and deletes. Then, to test a scenario closer to real life usage, I added indexes, more data variation, and tweaked SQLite for better data durability other than pure performance (thanks to <a href="https://x.com/jasonleowsg" target="_blank" rel="noopener noreferrer">@jasonleowsg</a> for pointing me to <a href="https://x.com/meln1k/status/1813314113705062774" target="_blank" rel="noopener noreferrer">this post</a>). For Node-based apps, I switched from sqlite3 to <a href="https://www.npmjs.com/package/better-sqlite3" target="_blank" rel="noopener noreferrer">better-sqlite3</a> (thanks to <a href="https://x.com/theSlavenIvanov" target="_blank" rel="noopener noreferrer">@theSlavenIvanov</a> for the recommendation), and this really levels the playing field.
 		</p>
